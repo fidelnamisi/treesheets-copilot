@@ -1,6 +1,6 @@
 
 import { useState, useEffect, useRef } from 'react';
-import type { Workspace, ChatSession, ChatMessage } from './shared/types';
+import type { Workspace, ChatSession, ChatMessage, CustomModel } from './shared/types';
 import './App.css';
 
 function App() {
@@ -10,7 +10,9 @@ function App() {
 
   // State for multiple selected files
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
-  // Store content of each file individually
+  // Prevent sync override wipe when switching workspaces
+  const isLoadingWorkspaceRef = useRef<string | null>(null);
+
   // Store content of each file individually
   const [filesContent, setFilesContent] = useState<Record<string, string>>({});
 
@@ -31,10 +33,9 @@ function App() {
 
   // Settings State
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsProvider, setSettingsProvider] = useState('deepseek');
-  const [settingsApiKey, setSettingsApiKey] = useState('');
-  const [settingsModel, setSettingsModel] = useState('deepseek-reasoner');
-  const [settingsBaseUrl, setSettingsBaseUrl] = useState('https://api.deepseek.com');
+  const [models, setModels] = useState<CustomModel[]>([]);
+  const [activeModelId, setActiveModelId] = useState<string>('');
+  const [editingModel, setEditingModel] = useState<CustomModel | null>(null);
 
   // Context Menu State
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filePath: string; fileName: string } | null>(null);
@@ -43,7 +44,7 @@ function App() {
   const providerPresets: Record<string, { label: string; baseUrl: string; defaultModel: string; placeholder: string }> = {
     deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', defaultModel: 'deepseek-reasoner', placeholder: 'sk-...' },
     openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-4o', placeholder: 'sk-...' },
-    anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', defaultModel: 'claude-sonnet-4-20250514', placeholder: 'sk-ant-...' },
+    anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com', defaultModel: 'claude-3-5-haiku-latest', placeholder: 'sk-ant-...' },
     google: { label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', defaultModel: 'gemini-2.0-flash', placeholder: 'AIzaSy...' },
     custom: { label: 'Custom (OpenAI-compatible)', baseUrl: 'http://localhost:11434/v1', defaultModel: 'llama3', placeholder: 'API key...' },
   };
@@ -52,7 +53,15 @@ function App() {
 
   useEffect(() => {
     loadWorkspaces();
+    loadModels();
   }, []);
+
+  const loadModels = async () => {
+    const loadedModels = await window.electronAPI.getModels();
+    setModels(loadedModels);
+    const active = await window.electronAPI.getActiveModel();
+    if (active) setActiveModelId(active.id);
+  };
 
   // Scroll to bottom
   useEffect(() => {
@@ -66,6 +75,7 @@ function App() {
   // Load Workspace State
   useEffect(() => {
     if (activeWorkspaceId) {
+      isLoadingWorkspaceRef.current = activeWorkspaceId;
       const ws = workspaces.find(w => w.id === activeWorkspaceId);
       if (ws) {
         (async () => {
@@ -80,22 +90,11 @@ function App() {
               }
             }
           }
-          loadFiles(ws.path);
-          window.electronAPI.startWatching(ws.path);
+          loadFiles(ws.referencedFiles || []);
+          isLoadingWorkspaceRef.current = null;
         })();
 
-        const unsubscribe = window.electronAPI.onFileChanged((data) => {
-          console.log('File changed:', data);
-          loadFiles(ws.path);
-          if (data.type === 'change' && selectedFiles.includes(data.path)) {
-            loadFileContent(data.path);
-          }
-        });
-
-        return () => {
-          window.electronAPI.stopWatching();
-          unsubscribe();
-        };
+        // File watching is disabled for arbitrary referenced files list right now, since they can be scattered across the drive.
       }
     } else {
       setFiles([]);
@@ -119,7 +118,7 @@ function App() {
 
   // Save State
   useEffect(() => {
-    if (activeWorkspaceId) {
+    if (activeWorkspaceId && isLoadingWorkspaceRef.current !== activeWorkspaceId) {
       window.electronAPI.saveWorkspaceState(activeWorkspaceId, {
         selectedFilePaths: selectedFiles,
         chatSessions: chatSessions,
@@ -176,9 +175,9 @@ function App() {
     }
   };
 
-  const loadFiles = async (path: string) => {
+  const loadFiles = async (filePaths: string[]) => {
     try {
-      const workspaceFiles = await window.electronAPI.scanWorkspaceFiles(path);
+      const workspaceFiles = await window.electronAPI.scanWorkspaceFiles(filePaths);
       setFiles(workspaceFiles);
     } catch (error) {
       console.error('Failed to load files:', error);
@@ -200,8 +199,7 @@ function App() {
     if (!content.trim()) return;
 
     // Check Key
-    const storedKey = await window.electronAPI.getApiKey();
-    if (!storedKey) {
+    if (!activeModelId && models.length === 0) {
       setShowSettings(true);
       return;
     }
@@ -229,11 +227,20 @@ function App() {
     setInput('');
     setSending(true);
 
-    const activeContext = selectedFiles.map(path => {
+    // Live refresh context files
+    const freshContextPromises = selectedFiles.map(async (path) => {
       const file = files.find(f => f.path === path);
-      const c = filesContent[path] || '';
-      return `--- File: ${file?.name} ---\n${c}\n`;
-    }).join('\n');
+      try {
+        const res = await window.electronAPI.parseCtsFile(path);
+        const c = (res.success && res.content !== undefined) ? res.content : (filesContent[path] || '');
+        return `--- File: ${file?.name} ---\n${c}\n`;
+      } catch (e) {
+        return `--- File: ${file?.name} ---\n[Error reading file]\n`;
+      }
+    });
+
+    const loadedContexts = await Promise.all(freshContextPromises);
+    const activeContext = loadedContexts.join('\n');
 
     try {
       const response = await window.electronAPI.sendChat(newMessages, activeContext);
@@ -264,34 +271,51 @@ function App() {
     setChatSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: newTitle.trim() } : s));
   };
 
+  const deleteSession = (sessionId: string) => {
+    if (confirm('Are you sure you want to delete this chat branch completely?')) {
+      setChatSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (primarySessionId === sessionId) setPrimarySessionId(null);
+      if (secondarySessionId === sessionId) setSecondarySessionId(null);
+    }
+  };
+
   const handleImportFile = async () => {
     if (!activeWorkspaceId) return;
     const ws = workspaces.find(w => w.id === activeWorkspaceId);
     if (!ws) return;
 
-    const success = await window.electronAPI.importFile(ws.path);
-    if (success) {
-      loadFiles(ws.path);
+    const filePaths = await window.electronAPI.importFile();
+    if (filePaths && filePaths.length > 0) {
+      const activeWs = { ...ws, referencedFiles: [...(ws.referencedFiles || []), ...filePaths] };
+      setWorkspaces(prev => prev.map(w => w.id === ws.id ? activeWs : w));
+      await window.electronAPI.saveWorkspaceState(ws.id, { referencedFiles: activeWs.referencedFiles });
+      loadFiles(activeWs.referencedFiles || []);
     }
   };
 
   const handleAddWorkspace = async () => {
     try {
-      const dir = await window.electronAPI.selectDirectory();
-      if (!dir) return;
+      const newWs = await window.electronAPI.createWorkspace();
+      if (!newWs) return;
 
-      if (workspaces.some(w => w.path === dir.path)) {
-        alert('Workspace already exists for this directory.');
-        return;
-      }
-
-      await window.electronAPI.addWorkspace({
-        name: dir.name,
-        path: dir.path
-      });
       await loadWorkspaces();
+      setActiveWorkspaceId(newWs.id);
+      window.electronAPI.setLastActiveWorkspace(newWs.id);
     } catch (error) {
       console.error('Failed to add workspace:', error);
+    }
+  };
+
+  const handleOpenWorkspace = async () => {
+    try {
+      const openedWs = await window.electronAPI.openWorkspace();
+      if (!openedWs) return;
+
+      await loadWorkspaces();
+      setActiveWorkspaceId(openedWs.id);
+      window.electronAPI.setLastActiveWorkspace(openedWs.id);
+    } catch (error) {
+      console.error('Failed to open workspace:', error);
     }
   };
 
@@ -328,75 +352,111 @@ function App() {
       {/* Settings Modal */}
       {showSettings && (
         <div className="modal-overlay">
-          <div className="modal">
-            <h2>AI Provider Settings</h2>
-            <div className="form-group">
-              <label>Provider</label>
-              <select
-                value={settingsProvider}
-                onChange={(e) => {
-                  const p = e.target.value;
-                  setSettingsProvider(p);
-                  const preset = providerPresets[p];
-                  if (preset) {
-                    setSettingsBaseUrl(preset.baseUrl);
-                    setSettingsModel(preset.defaultModel);
-                  }
-                }}
-              >
-                {Object.entries(providerPresets).map(([key, val]) => (
-                  <option key={key} value={key}>{val.label}</option>
-                ))}
-              </select>
+          <div className="modal settings-modal" style={{ maxWidth: '600px', width: '100%' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h2 style={{ margin: 0 }}>AI Models</h2>
+              <button onClick={() => setShowSettings(false)} style={{ background: 'none', border: 'none', color: '#fff', fontSize: '1.2rem', cursor: 'pointer' }}>×</button>
             </div>
-            <div className="form-group">
-              <label>API Key</label>
-              <input
-                type="password"
-                value={settingsApiKey}
-                onChange={(e) => setSettingsApiKey(e.target.value)}
-                placeholder={providerPresets[settingsProvider]?.placeholder || 'API key...'}
-              />
-            </div>
-            <div className="form-group">
-              <label>Model</label>
-              <input
-                type="text"
-                value={settingsModel}
-                onChange={(e) => setSettingsModel(e.target.value)}
-                placeholder="Model name"
-              />
-            </div>
-            <div className="form-group">
-              <label>Base URL</label>
-              <input
-                type="text"
-                value={settingsBaseUrl}
-                onChange={(e) => setSettingsBaseUrl(e.target.value)}
-                placeholder="https://api.example.com/v1"
-              />
-            </div>
-            <div className="modal-actions">
-              <button onClick={() => setShowSettings(false)}>Cancel</button>
-              <button className="primary" onClick={async () => {
-                await window.electronAPI.setAiConfig({
-                  provider: settingsProvider,
-                  apiKey: settingsApiKey,
-                  model: settingsModel,
-                  baseUrl: settingsBaseUrl
-                });
-                setShowSettings(false);
-              }}>Save</button>
-            </div>
+
+            {!editingModel ? (
+              <>
+                <div className="model-list" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '1rem' }}>
+                  {models.length === 0 && <div style={{ color: '#aaa' }}>No models added yet.</div>}
+                  {models.map(m => (
+                    <div key={m.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#333', padding: '0.5rem 1rem', borderRadius: '4px' }}>
+                      <div>
+                        <strong>{m.name}</strong> <span style={{ fontSize: '0.8rem', color: '#aaa', marginLeft: '0.5rem' }}>({providerPresets[m.provider]?.label || m.provider})</span>
+                        <div style={{ fontSize: '0.8rem', color: '#888' }}>{m.model}</div>
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button style={{ padding: '0.2rem 0.6rem', fontSize: '0.8rem' }} onClick={() => setEditingModel(m)}>Edit</button>
+                        <button style={{ padding: '0.2rem 0.6rem', fontSize: '0.8rem', background: '#d32f2f' }}
+                          onClick={async () => {
+                            if (confirm('Delete model?')) {
+                              await window.electronAPI.deleteModel(m.id);
+                              loadModels();
+                            }
+                          }}>Delete</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <button className="primary" onClick={() => setEditingModel({ id: crypto.randomUUID(), name: 'New Model', provider: 'deepseek', apiKey: '', model: 'deepseek-reasoner', baseUrl: 'https://api.deepseek.com' as any })}>+ Add Model</button>
+              </>
+            ) : (
+              <div className="model-editor">
+                <div className="form-group">
+                  <label>Model Name (alias)</label>
+                  <input type="text" value={editingModel.name} onChange={e => setEditingModel({ ...editingModel, name: e.target.value })} placeholder="e.g. My Llama3" />
+                </div>
+                <div className="form-group">
+                  <label>Provider API Type</label>
+                  <select
+                    value={editingModel.provider}
+                    onChange={(e) => {
+                      const p = e.target.value as any;
+                      const preset = providerPresets[p];
+                      if (preset) {
+                        setEditingModel({ ...editingModel, provider: p, baseUrl: preset.baseUrl, model: preset.defaultModel });
+                      }
+                    }}
+                  >
+                    {Object.entries(providerPresets).map(([key, val]) => (
+                      <option key={key} value={key}>{val.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>API Key</label>
+                  <input
+                    type="password"
+                    value={editingModel.apiKey}
+                    onChange={(e) => setEditingModel({ ...editingModel, apiKey: e.target.value })}
+                    placeholder={providerPresets[editingModel.provider]?.placeholder || 'API key...'}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Model Name</label>
+                  <input
+                    type="text"
+                    value={editingModel.model}
+                    onChange={(e) => setEditingModel({ ...editingModel, model: e.target.value })}
+                    placeholder="e.g. gpt-4, gemini-2.0-flash..."
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Base URL</label>
+                  <input
+                    type="text"
+                    value={editingModel.baseUrl}
+                    onChange={(e) => setEditingModel({ ...editingModel, baseUrl: e.target.value })}
+                    placeholder="https://api.example.com/v1"
+                  />
+                </div>
+                <div className="modal-actions" style={{ marginTop: '1rem', display: 'flex', gap: '1rem', justifyContent: 'flex-end' }}>
+                  <button onClick={() => setEditingModel(null)}>Cancel</button>
+                  <button className="primary" onClick={async () => {
+                    await window.electronAPI.saveModel(editingModel);
+                    await window.electronAPI.setActiveModel(editingModel.id);
+                    setActiveModelId(editingModel.id);
+                    setEditingModel(null);
+                    loadModels();
+                  }}>Save Model</button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
 
       {/* Sidebar - Workspace & Files */}
       <div className="sidebar">
-        <div className="sidebar-header">
+        <div className="sidebar-header" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '0.5rem' }}>
           <h2>Workspaces</h2>
-          <button onClick={handleAddWorkspace} className="add-btn">+</button>
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <button onClick={handleAddWorkspace} className="add-btn" style={{ fontSize: '0.9rem', border: '1px solid #444', borderRadius: '4px', padding: '0.2rem 0.5rem' }}>New Workspace</button>
+            <button onClick={handleOpenWorkspace} className="add-btn" style={{ fontSize: '0.9rem', border: '1px solid #444', borderRadius: '4px', padding: '0.2rem 0.5rem' }}>Open Workspace</button>
+          </div>
         </div>
         <ul className="workspace-list">
           {workspaces.map(ws => (
@@ -427,7 +487,7 @@ function App() {
           <div className="files-section">
             <div className="sidebar-header">
               <h3>Files</h3>
-              <button onClick={handleImportFile} className="add-btn" title="Import .cts file">Import</button>
+              <button onClick={handleImportFile} className="add-btn" title="Add File(s)">+</button>
             </div>
             <div className="file-list-scroll">
               {files.map(file => (
@@ -448,12 +508,7 @@ function App() {
         )}
 
         <div className="sidebar-footer">
-          <button onClick={async () => {
-            const config = await window.electronAPI.getAiConfig();
-            setSettingsProvider(config.provider || 'deepseek');
-            setSettingsApiKey(config.apiKey || '');
-            setSettingsModel(config.model || 'deepseek-reasoner');
-            setSettingsBaseUrl(config.baseUrl || 'https://api.deepseek.com');
+          <button onClick={() => {
             setShowSettings(true);
           }} >⚙️ Settings</button>
         </div>
@@ -480,6 +535,25 @@ function App() {
             setContextMenu(null);
           }}>
             ✕ Remove from Context
+          </div>
+          <div className="context-menu-item" style={{ color: '#ff4d4f' }} onClick={async () => {
+            const pathToRemove = contextMenu.filePath;
+            setContextMenu(null);
+            if (confirm('Are you sure you want to remove this file from the workspace reference?')) {
+              setSelectedFiles(prev => prev.filter(p => p !== pathToRemove));
+              if (activeWorkspaceId) {
+                const ws = workspaces.find(w => w.id === activeWorkspaceId);
+                if (ws) {
+                  const newRefs = (ws.referencedFiles || []).filter(p => p !== pathToRemove);
+                  const activeWs = { ...ws, referencedFiles: newRefs };
+                  setWorkspaces(prev => prev.map(w => w.id === ws.id ? activeWs : w));
+                  await window.electronAPI.saveWorkspaceState(ws.id, { referencedFiles: newRefs });
+                  loadFiles(newRefs);
+                }
+              }
+            }
+          }}>
+            ✕ Remove from Workspace
           </div>
         </div>
       )}
@@ -515,8 +589,15 @@ function App() {
               contextCount={selectedFiles.length}
               onBranch={(msgId: string) => handleBranchFromMessage(primarySessionId!, msgId)}
               onRenameSession={renameSession}
+              onDeleteSession={deleteSession}
               contextFiles={files.filter(f => selectedFiles.includes(f.path))}
               onExportChat={() => handleExportChat(primarySessionId)}
+              models={models}
+              activeModelId={activeModelId}
+              onModelChange={async (id: string) => {
+                setActiveModelId(id);
+                await window.electronAPI.setActiveModel(id);
+              }}
             />
           ) : (
             <div className="empty-state">Select a workspace</div>
@@ -542,8 +623,15 @@ function App() {
               contextCount={selectedFiles.length}
               onBranch={(msgId: string) => handleBranchFromMessage(secondarySessionId!, msgId)}
               onRenameSession={renameSession}
+              onDeleteSession={deleteSession}
               contextFiles={files.filter(f => selectedFiles.includes(f.path))}
               onExportChat={() => handleExportChat(secondarySessionId)}
+              models={models}
+              activeModelId={activeModelId}
+              onModelChange={async (id: string) => {
+                setActiveModelId(id);
+                await window.electronAPI.setActiveModel(id);
+              }}
             />
           )}
         </div>
@@ -556,7 +644,7 @@ function App() {
 const ChatPane = ({
   sessionId, onChangeSession, sessions, onCreateSession,
   messages, onSendMessage, inputValue, onInputChange, isSending, endRef, contextCount, onBranch,
-  onRenameSession, contextFiles, onExportChat
+  onRenameSession, onDeleteSession, contextFiles, onExportChat, models, activeModelId, onModelChange
 }: any) => {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isRenaming, setIsRenaming] = useState(false);
@@ -689,13 +777,27 @@ const ChatPane = ({
           </select>
         )}
         {sessionId && !isRenaming && (
-          <button onClick={startRenaming} className="chat-header-btn" title="Rename this chat session">✏️</button>
+          <button onClick={startRenaming} className="chat-header-btn" title="Rename Chat Branch">✏️</button>
         )}
         {sessionId && messages.length > 0 && (
-          <button onClick={onExportChat} className="chat-header-btn" title="Export this chat as a Markdown file">📤</button>
+          <button onClick={onExportChat} className="chat-header-btn" title="Export Chat to Markdown">📤</button>
         )}
-        <button onClick={onCreateSession} className="chat-header-btn" title="Start a new chat session">+</button>
+        {sessionId && (
+          <button onClick={() => onDeleteSession(sessionId)} className="chat-header-btn" title="Delete Chat Branch" style={{ color: '#ff4d4f' }}>🗑️</button>
+        )}
+        <button onClick={onCreateSession} className="chat-header-btn" title="New Chat Branch">+</button>
       </div>
+
+      {contextFiles && contextFiles.length > 0 && (
+        <div className="context-files-bar" style={{ display: 'flex', gap: '0.5rem', background: '#252526', padding: '0.4rem 0.8rem', borderBottom: '1px solid #333', overflowX: 'auto', alignItems: 'center' }}>
+          <span style={{ fontSize: '0.75rem', color: '#888', marginRight: '0.2rem', flexShrink: 0 }}>Context:</span>
+          {contextFiles.map((file: any) => (
+            <span key={file.path} style={{ background: '#007acc', color: 'white', padding: '0.2rem 0.6rem', borderRadius: '20px', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+              {file.name}
+            </span>
+          ))}
+        </div>
+      )}
 
       <div className="messages-area">
         {messages.length === 0 && <div className="empty-chat">No messages. Context: {contextCount} files. Type @ to reference a file.</div>}
@@ -728,7 +830,7 @@ const ChatPane = ({
       </div>
 
       <div className="input-area">
-        <div className="input-row">
+        <div className="input-row" style={{ alignItems: 'flex-start' }}>
           <div className="textarea-wrapper">
             {showAtMenu && filteredFiles.length > 0 && (
               <div className="at-autocomplete">
@@ -752,11 +854,29 @@ const ChatPane = ({
               className="chat-textarea"
             />
           </div>
-          <button
-            onClick={() => onSendMessage(inputValue)}
-            disabled={isSending}
-            className="send-btn"
-          >Send</button>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <select
+              className="model-select"
+              value={activeModelId || ''}
+              onChange={(e) => onModelChange(e.target.value)}
+              style={{
+                padding: '0.4rem', borderRadius: '4px', background: '#333',
+                color: '#fff', border: '1px solid #444', fontSize: '0.8rem',
+                width: '120px'
+              }}
+            >
+              <option value="" disabled>Select Model</option>
+              {models?.map((m: any) => <option key={m.id} value={m.id} title={m.name}>{m.name.length > 15 ? m.name.substring(0, 15) + '...' : m.name}</option>)}
+            </select>
+            <button
+              onClick={() => onSendMessage(inputValue)}
+              disabled={isSending}
+              className="send-btn"
+              style={{ height: '100%', minHeight: '40px' }}
+            >
+              Send
+            </button>
+          </div>
         </div>
       </div>
     </div>

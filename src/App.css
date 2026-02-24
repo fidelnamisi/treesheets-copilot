@@ -690,7 +690,14 @@
 }
 
 .file-item.selected-context {
-  background: #37373d;
+  background: #007acc;
+  color: white;
+  border-radius: 4px;
+}
+
+.file-item.selected-context .file-name {
+  color: white;
+  font-weight: 500;
 }
 
 .file-item .file-icon {

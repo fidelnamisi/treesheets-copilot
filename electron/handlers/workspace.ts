@@ -9,93 +9,123 @@ import * as path from 'path';
 // Define IPC channel names as constants
 export const IPC_CHANNELS = {
     GET_WORKSPACES: 'get-workspaces',
-    ADD_WORKSPACE: 'add-workspace',
+    CREATE_WORKSPACE: 'create-workspace',
+    OPEN_WORKSPACE: 'open-workspace',
     REMOVE_WORKSPACE: 'remove-workspace',
-    SELECT_DIRECTORY: 'select-directory',
     GET_LAST_ACTIVE_WORKSPACE: 'get-last-active-workspace',
     set_LAST_ACTIVE_WORKSPACE: 'set-last-active-workspace',
     SAVE_WORKSPACE_STATE: 'save-workspace-state',
     LOAD_WORKSPACE_STATE: 'load-workspace-state'
 };
 
-const WORKSPACES_DIR = path.join(app.getPath('userData'), 'workspaces');
-
-// Helper to ensure workspaces directory exists
-const ensureWorkspacesDir = async () => {
-    try {
-        await fs.access(WORKSPACES_DIR);
-    } catch {
-        await fs.mkdir(WORKSPACES_DIR, { recursive: true });
-    }
-};
-
 export const registerWorkspaceHandlers = () => {
-    ensureWorkspacesDir();
-
-    // Get all workspaces (Read JSONs)
+    // Get all tracked workspaces (Read from recentWorkspaces)
     ipcMain.handle(IPC_CHANNELS.GET_WORKSPACES, async () => {
-        try {
-            await ensureWorkspacesDir();
-            const files = await fs.readdir(WORKSPACES_DIR);
-            const jsonFiles = files.filter(f => f.endsWith('.json'));
+        const recentPaths = store.get('recentWorkspaces') || [];
+        const workspaces: Workspace[] = [];
+        const validPaths: string[] = [];
 
-            const workspaces: Workspace[] = [];
-            for (const file of jsonFiles) {
-                try {
-                    const content = await fs.readFile(path.join(WORKSPACES_DIR, file), 'utf-8');
-                    const ws = JSON.parse(content);
-                    workspaces.push(ws);
-                } catch (e) {
-                    console.error(`Error reading workspace file ${file}:`, e);
-                }
+        for (const filePath of recentPaths) {
+            try {
+                const content = await fs.readFile(filePath, 'utf-8');
+                const ws = JSON.parse(content);
+                workspaces.push(ws);
+                validPaths.push(filePath);
+            } catch (e) {
+                console.error(`Error reading workspace file ${filePath}:`, e);
             }
-            // Sort by createdAt desc
-            return workspaces.sort((a, b) => b.createdAt - a.createdAt);
-        } catch (error) {
-            console.error('Failed to get workspaces:', error);
-            return [];
         }
+
+        // Clean up invalid paths
+        if (validPaths.length !== recentPaths.length) {
+            store.set('recentWorkspaces', validPaths);
+        }
+
+        // Sort by createdAt desc
+        return workspaces.sort((a, b) => b.createdAt - a.createdAt);
     });
 
-    // Add a new workspace
-    ipcMain.handle(IPC_CHANNELS.ADD_WORKSPACE, async (_, workspaceData: { name: string, path: string }) => {
+    // Create a new workspace file natively dialog
+    ipcMain.handle(IPC_CHANNELS.CREATE_WORKSPACE, async () => {
+        const result = await dialog.showSaveDialog({
+            title: 'Create New Workspace',
+            defaultPath: 'New Workspace.tscopilotworkspace',
+            filters: [{ name: 'TreeSheets Copilot Workspace', extensions: ['tscopilotworkspace'] }]
+        });
+
+        if (result.canceled || !result.filePath) {
+            return null;
+        }
+
+        const filePath = result.filePath;
+        const name = path.basename(filePath, '.tscopilotworkspace');
+
         const newWorkspace: Workspace = {
-            id: uuidv4(),
-            name: workspaceData.name,
-            path: workspaceData.path,
+            id: filePath,
+            name: name,
+            path: filePath,
             createdAt: Date.now(),
             selectedFilePaths: [],
-            chatSessions: []
+            chatSessions: [],
+            referencedFiles: []
         };
 
-        const filePath = path.join(WORKSPACES_DIR, `${newWorkspace.id}.json`);
         await fs.writeFile(filePath, JSON.stringify(newWorkspace, null, 2));
+
+        const recentPaths = store.get('recentWorkspaces') || [];
+        if (!recentPaths.includes(filePath)) {
+            store.set('recentWorkspaces', [filePath, ...recentPaths]);
+        }
 
         return newWorkspace;
     });
 
-    // Remove a workspace
-    ipcMain.handle(IPC_CHANNELS.REMOVE_WORKSPACE, async (_, id: string) => {
-        const filePath = path.join(WORKSPACES_DIR, `${id}.json`);
-        try {
-            await fs.unlink(filePath);
+    // Open existing workspace
+    ipcMain.handle(IPC_CHANNELS.OPEN_WORKSPACE, async () => {
+        const result = await dialog.showOpenDialog({
+            title: 'Open Workspace',
+            properties: ['openFile'],
+            filters: [{ name: 'TreeSheets Copilot Workspace', extensions: ['tscopilotworkspace'] }]
+        });
 
-            // Handle last active
-            const lastActive = store.get('lastActiveWorkspaceId');
-            if (lastActive === id) {
-                store.delete('lastActiveWorkspaceId' as any);
-            }
-
-            return true;
-        } catch (error) {
-            console.error(`Failed to remove workspace ${id}:`, error);
-            return false;
+        if (result.canceled || result.filePaths.length === 0) {
+            return null;
         }
+
+        const filePath = result.filePaths[0];
+
+        try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            const loadedWorkspace = JSON.parse(content);
+            const recentPaths = store.get('recentWorkspaces') || [];
+            if (!recentPaths.includes(filePath)) {
+                store.set('recentWorkspaces', [filePath, ...recentPaths]);
+            }
+            return loadedWorkspace;
+        } catch (error) {
+            console.error('Failed to parse workspace file:', error);
+            return null;
+        }
+    });
+
+    // Remove a workspace merely from recents
+    ipcMain.handle(IPC_CHANNELS.REMOVE_WORKSPACE, async (_, id: string) => {
+        const recentPaths = store.get('recentWorkspaces') || [];
+        const newPaths = recentPaths.filter(p => p !== id);
+        store.set('recentWorkspaces', newPaths);
+
+        // Handle last active
+        const lastActive = store.get('lastActiveWorkspaceId');
+        if (lastActive === id) {
+            store.delete('lastActiveWorkspaceId' as any);
+        }
+
+        return true;
     });
 
     // Save workspace state (selected files, chat history)
     ipcMain.handle(IPC_CHANNELS.SAVE_WORKSPACE_STATE, async (_, { id, state }: { id: string, state: Partial<Workspace> }) => {
-        const filePath = path.join(WORKSPACES_DIR, `${id}.json`);
+        const filePath = id; // Since id is now the absolute filePath
         try {
             const content = await fs.readFile(filePath, 'utf-8');
             const ws: Workspace = JSON.parse(content);
@@ -109,9 +139,9 @@ export const registerWorkspaceHandlers = () => {
         }
     });
 
-    // Explicit load workspace (though getWorkspaces loads all, this is good for refresh)
+    // Explicit load workspace
     ipcMain.handle(IPC_CHANNELS.LOAD_WORKSPACE_STATE, async (_, id: string) => {
-        const filePath = path.join(WORKSPACES_DIR, `${id}.json`);
+        const filePath = id; // id is the filePath
         try {
             const content = await fs.readFile(filePath, 'utf-8');
             return JSON.parse(content);
@@ -119,22 +149,6 @@ export const registerWorkspaceHandlers = () => {
             console.error(`Failed to load workspace ${id}:`, error);
             return null;
         }
-    });
-
-    // Select directory dialog
-    ipcMain.handle(IPC_CHANNELS.SELECT_DIRECTORY, async () => {
-        const result = await dialog.showOpenDialog({
-            properties: ['openDirectory', 'createDirectory']
-        });
-
-        if (result.canceled || result.filePaths.length === 0) {
-            return null;
-        }
-
-        const dirPath = result.filePaths[0];
-        const name = path.basename(dirPath);
-
-        return { path: dirPath, name };
     });
 
     // Get/Set last active workspace

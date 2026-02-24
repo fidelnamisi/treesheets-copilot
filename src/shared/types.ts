@@ -18,11 +18,12 @@ export interface ChatSession {
 export interface Workspace {
     id: string;
     name: string;
-    path: string; // Directory path
+    path: string; // Absolute path to the .tscopilotworkspace file
     createdAt: number;
     selectedFilePaths: string[]; // Files currently active in context
     chatSessions: ChatSession[];
     lastActiveSessionId?: string;
+    referencedFiles?: string[]; // Array of absolute paths to original files
 }
 
 export type AiProvider = 'deepseek' | 'openai' | 'anthropic' | 'google' | 'custom';
@@ -68,14 +69,32 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, { label: string; baseUrl: s
     }
 };
 
+export interface CustomModel {
+    id: string;
+    name: string;
+    provider: AiProvider;
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+}
+
 export interface AppStore {
     lastActiveWorkspaceId?: string;
     theme: 'light' | 'dark';
-    // AI Configuration
+
+    // Multiple models tracking
+    models?: CustomModel[];
+    activeModelId?: string;
+
+    // Workspace tracking
+    recentWorkspaces?: string[];
+
+    // Default/active AI Configuration (legacy mode support)
     aiProvider?: AiProvider;
     aiApiKey?: string;
     aiModel?: string;
     aiBaseUrl?: string;
+
     // Legacy (kept for migration)
     openAiApiKey?: string;
     modelName?: string;

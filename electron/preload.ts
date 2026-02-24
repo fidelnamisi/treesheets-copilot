@@ -5,12 +5,12 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('electronAPI', {
     getWorkspaces: () => ipcRenderer.invoke('get-workspaces'),
-    addWorkspace: (data: any) => ipcRenderer.invoke('add-workspace', data),
+    createWorkspace: () => ipcRenderer.invoke('create-workspace'),
+    openWorkspace: () => ipcRenderer.invoke('open-workspace'),
     removeWorkspace: (id: string) => ipcRenderer.invoke('remove-workspace', id),
-    selectDirectory: () => ipcRenderer.invoke('select-directory'),
     getLastActiveWorkspace: () => ipcRenderer.invoke('get-last-active-workspace'),
     setLastActiveWorkspace: (id: string) => ipcRenderer.invoke('set-last-active-workspace', id),
-    scanWorkspaceFiles: (path: string) => ipcRenderer.invoke('scan-workspace-files', path),
+    scanWorkspaceFiles: (paths: string[]) => ipcRenderer.invoke('scan-workspace-files', paths),
     parseCtsFile: (path: string) => ipcRenderer.invoke('parse-cts-file', path),
     startWatching: (path: string) => ipcRenderer.invoke('start-watching', path),
     stopWatching: () => ipcRenderer.invoke('stop-watching'),
@@ -28,8 +28,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getAiConfig: () => ipcRenderer.invoke('get-ai-config'),
     setAiConfig: (config: { provider: string; apiKey: string; model: string; baseUrl: string }) => ipcRenderer.invoke('set-ai-config', config),
 
+    // Model Management
+    getModels: () => ipcRenderer.invoke('get-models'),
+    saveModel: (model: any) => ipcRenderer.invoke('save-model', model),
+    deleteModel: (id: string) => ipcRenderer.invoke('delete-model', id),
+    setActiveModel: (id: string) => ipcRenderer.invoke('set-active-model', id),
+    getActiveModel: () => ipcRenderer.invoke('get-active-model'),
+
     // File Ops
-    importFile: (workspacePath: string) => ipcRenderer.invoke('import-file', workspacePath),
+    importFile: () => ipcRenderer.invoke('import-file'),
     openFileNative: (filePath: string) => ipcRenderer.invoke('open-file-native', filePath),
     exportChat: (data: { title: string; content: string }) => ipcRenderer.invoke('export-chat', data),
+    deleteFile: (filePath: string) => ipcRenderer.invoke('delete-file', filePath),
 });

@@ -1,6 +1,7 @@
 
 import { ipcMain } from 'electron';
 import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 import { store } from '../store.js';
 import { ChatMessage } from '../../src/shared/types.js';
 
@@ -11,95 +12,16 @@ export const IPC_CHANNELS_AI = {
     GET_MODEL: 'get-model',
     SET_MODEL: 'set-model',
     GET_AI_CONFIG: 'get-ai-config',
-    SET_AI_CONFIG: 'set-ai-config'
+    SET_AI_CONFIG: 'set-ai-config',
+    GET_MODELS: 'get-models',
+    SAVE_MODEL: 'save-model',
+    DELETE_MODEL: 'delete-model',
+    SET_ACTIVE_MODEL: 'set-active-model',
+    GET_ACTIVE_MODEL: 'get-active-model',
 };
 
-/**
- * Call Google Gemini using its native REST API (not the OpenAI compatibility layer).
- * This is more reliable and supports all Gemini features.
- */
-async function callGeminiNative(
-    apiKey: string,
-    model: string,
-    systemPrompt: string,
-    messages: { role: string; content: string }[]
-): Promise<{ success: boolean; content?: string; error?: string }> {
-    // Gemini API: POST /v1beta/models/{model}:generateContent?key={key}
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-    // Convert OpenAI-style messages to Gemini format
-    // Gemini uses "user" and "model" roles (not "assistant")
-    const contents = messages.map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content || '(empty)' }]
-    }));
-
-    const body: any = {
-        contents,
-        generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 8192,
-        }
-    };
-
-    // Add system instruction if provided
-    if (systemPrompt && systemPrompt.trim()) {
-        body.systemInstruction = {
-            parts: [{ text: systemPrompt }]
-        };
-    }
-
-    console.log(`[AI] Calling Gemini native API: model=${model}, messages=${contents.length}`);
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        let errorMsg = `Gemini API error (${response.status})`;
-
-        try {
-            const errorJson = JSON.parse(errorText);
-            if (errorJson.error?.message) {
-                errorMsg = errorJson.error.message;
-            }
-        } catch {
-            if (errorText) errorMsg += `: ${errorText.substring(0, 200)}`;
-        }
-
-        if (response.status === 400) {
-            errorMsg = `Bad request to Gemini: ${errorMsg}. Try a different model name (e.g. gemini-2.0-flash).`;
-        } else if (response.status === 403 || response.status === 401) {
-            errorMsg = `Gemini authentication failed. Check your API key in Settings.`;
-        } else if (response.status === 404) {
-            errorMsg = `Gemini model "${model}" not found. Check the model name in Settings.`;
-        }
-
-        return { success: false, error: errorMsg };
-    }
-
-    const data = await response.json();
-
-    // Extract text from Gemini response
-    const candidate = data.candidates?.[0];
-    if (!candidate) {
-        return { success: false, error: 'Gemini returned no candidates.' };
-    }
-
-    const text = candidate.content?.parts?.map((p: any) => p.text || '').join('') || '';
-    if (!text.trim()) {
-        const finishReason = candidate.finishReason;
-        if (finishReason === 'SAFETY') {
-            return { success: false, error: 'Gemini blocked the response due to safety filters.' };
-        }
-        return { success: false, error: 'Gemini returned an empty response.' };
-    }
-
-    return { success: true, content: text };
-}
+// Removed natively implemented Gemini client in favor of the OpenAI compatibility layer
 
 export const registerAiHandlers = () => {
     // --- Legacy API Key handlers (kept for backward compat) ---
@@ -130,7 +52,52 @@ export const registerAiHandlers = () => {
         return true;
     });
 
-    // Model Management
+    // Model Management List APIs
+    ipcMain.handle(IPC_CHANNELS_AI.GET_MODELS, () => {
+        return store.get('models') || [];
+    });
+
+    ipcMain.handle(IPC_CHANNELS_AI.SAVE_MODEL, (_, model: any) => {
+        const models = store.get('models') || [];
+        const existingIndex = models.findIndex((m: any) => m.id === model.id);
+        if (existingIndex >= 0) {
+            models[existingIndex] = model;
+        } else {
+            models.push(model);
+        }
+        store.set('models', models);
+        // If this is the only model, auto-select it
+        if (!store.get('activeModelId')) {
+            store.set('activeModelId', model.id);
+        }
+        return true;
+    });
+
+    ipcMain.handle(IPC_CHANNELS_AI.DELETE_MODEL, (_, id: string) => {
+        const models = store.get('models') || [];
+        const newModels = models.filter((m: any) => m.id !== id);
+        store.set('models', newModels);
+        if (store.get('activeModelId') === id && newModels.length > 0) {
+            store.set('activeModelId', newModels[0].id);
+        } else if (newModels.length === 0) {
+            store.delete('activeModelId');
+        }
+        return true;
+    });
+
+    ipcMain.handle(IPC_CHANNELS_AI.SET_ACTIVE_MODEL, (_, id: string) => {
+        store.set('activeModelId', id);
+        return true;
+    });
+
+    ipcMain.handle(IPC_CHANNELS_AI.GET_ACTIVE_MODEL, () => {
+        const id = store.get('activeModelId');
+        if (!id) return null;
+        const models = store.get('models') || [];
+        return models.find((m: any) => m.id === id) || null;
+    });
+
+    // Model Legacy Management
     ipcMain.handle(IPC_CHANNELS_AI.GET_MODEL, () => {
         return store.get('aiModel') || store.get('modelName') || 'deepseek-reasoner';
     });
@@ -143,10 +110,27 @@ export const registerAiHandlers = () => {
     // Chat Logic
     ipcMain.handle(IPC_CHANNELS_AI.SEND_CHAT, async (_, args: { messages: ChatMessage[], context: string }) => {
         const { messages, context } = args;
-        const apiKey = store.get('aiApiKey') || store.get('openAiApiKey');
-        const model = store.get('aiModel') || store.get('modelName') || 'deepseek-reasoner';
-        const baseUrl = store.get('aiBaseUrl') || 'https://api.deepseek.com';
-        const provider = store.get('aiProvider') || 'deepseek';
+
+        let apiKey: string = '';
+        let model: string = '';
+        let baseUrl: string = '';
+        let provider: string = '';
+
+        const activeModelId = store.get('activeModelId');
+        const models = store.get('models') || [];
+        const activeModel = models.find((m: any) => m.id === activeModelId);
+
+        if (activeModel) {
+            apiKey = activeModel.apiKey;
+            model = activeModel.model;
+            baseUrl = activeModel.baseUrl;
+            provider = activeModel.provider;
+        } else {
+            apiKey = (store.get('aiApiKey') || store.get('openAiApiKey')) as string;
+            model = (store.get('aiModel') || store.get('modelName') || 'deepseek-reasoner') as string;
+            baseUrl = (store.get('aiBaseUrl') || 'https://api.deepseek.com') as string;
+            provider = (store.get('aiProvider') || 'deepseek') as string;
+        }
 
         if (!apiKey) {
             return {
@@ -186,51 +170,95 @@ ${context}`;
             }));
 
         try {
-            // ===== Google Gemini: Use native REST API =====
-            const isGemini = provider === 'google' ||
-                (baseUrl as string).includes('generativelanguage.googleapis.com');
+            if (provider === 'anthropic') {
+                // Ignore user-provided base URL if it's just the official Anthropic domain, 
+                // so the SDK can correctly append /v1/messages without double-appending.
+                let anthropicBaseUrl: string | undefined = baseUrl && baseUrl.length > 5 ? baseUrl as string : undefined;
+                if (anthropicBaseUrl && anthropicBaseUrl.includes('api.anthropic.com')) {
+                    anthropicBaseUrl = undefined;
+                }
 
-            if (isGemini) {
-                console.log(`[AI] Using Gemini native API (model=${model})`);
-                return await callGeminiNative(
-                    apiKey as string,
-                    model as string,
-                    systemPrompt,
-                    formattedMessages
-                );
+                // ===== Use native Anthropic API with Prompt Caching =====
+                const client = new Anthropic({
+                    apiKey: apiKey as string,
+                    baseURL: anthropicBaseUrl
+                });
+
+                const anthropicSystemBase = `You are a helpful AI assistant specialized in analyzing TreeSheets (.cts) files.`;
+                const anthropicSystemContext = hasContext
+                    ? `\n\nIMPORTANT INSTRUCTIONS:\n1. You are given the EXACT content of one or more TreeSheets files below.\n2. Each file's content is delimited by "--- File: [filename] ---".\n3. When asked about file content, you MUST quote ONLY the text that actually appears in the provided content below.\n4. NEVER fabricate, summarize, or invent content that is not present in the files.\n5. If asked to reproduce content, copy it VERBATIM from the context — do not paraphrase or reorganize.\n6. If you cannot find the requested content in the context, say "I cannot find that content in the provided file(s)."\n\nFILE CONTENT:\n${context}`
+                    : `\n\nNo file content is currently loaded. Ask the user to select files in the sidebar to add them as context.`;
+
+                // Split system prompt to cache the heavy context block
+                const anthropicSystem: any[] = [
+                    { type: 'text', text: anthropicSystemBase },
+                    {
+                        type: 'text',
+                        text: anthropicSystemContext,
+                        cache_control: { type: 'ephemeral' } // Caching Context ~90% savings
+                    }
+                ];
+
+                console.log(`[AI] Sending to Anthropic (${baseUrl || 'native'}) model=${model}, messages=${formattedMessages.length}`);
+
+                const completion = await client.messages.create({
+                    model: model as string,
+                    max_tokens: 4096,
+                    system: anthropicSystem,
+                    messages: formattedMessages.map(m => ({
+                        role: m.role as 'user' | 'assistant',
+                        content: m.content || '(empty)'
+                    })),
+                }, {
+                    headers: { 'anthropic-beta': 'prompt-caching-2024-07-31' }
+                });
+
+                // Console output for caching verification
+                const cacheCreateTokens = (completion.usage as any)?.cache_creation_input_tokens || 0;
+                const cacheReadTokens = (completion.usage as any)?.cache_read_input_tokens || 0;
+                console.log(`[Anthropic Cache] Creation: ${cacheCreateTokens}, Read: ${cacheReadTokens} (Cache hits save ~90% input cost)`);
+
+                const replyBlock = completion.content[0];
+                const reply = replyBlock?.type === 'text' ? replyBlock.text : '';
+
+                if (!reply) {
+                    return { success: false, error: 'AI returned an empty response. Please try again.' };
+                }
+                return { success: true, content: reply };
+
+            } else {
+                // ===== Use OpenAI SDK for all other providers (DeepSeek, OpenAI, Gemini) =====
+                const client = new OpenAI({
+                    apiKey: apiKey as string,
+                    baseURL: baseUrl as string
+                });
+
+                const finalMessages = [
+                    { role: 'system' as const, content: systemPrompt },
+                    ...formattedMessages.map(m => ({
+                        role: m.role as 'user' | 'assistant',
+                        content: m.content || '(empty)'
+                    }))
+                ];
+
+                console.log(`[AI] Sending to ${provider} (${baseUrl}) model=${model}, messages=${finalMessages.length}`);
+
+                const completion = await client.chat.completions.create({
+                    messages: finalMessages,
+                    model: model as string,
+                });
+
+                const reply = completion.choices?.[0]?.message?.content;
+
+                if (!reply) {
+                    return {
+                        success: false,
+                        error: 'AI returned an empty response. Please try again.'
+                    };
+                }
+
+                return { success: true, content: reply };
             }
-
-            // ===== All other providers: Use OpenAI SDK =====
-            const client = new OpenAI({
-                apiKey: apiKey as string,
-                baseURL: baseUrl as string
-            });
-
-            const finalMessages = [
-                { role: 'system' as const, content: systemPrompt },
-                ...formattedMessages.map(m => ({
-                    role: m.role as 'user' | 'assistant',
-                    content: m.content || '(empty)'
-                }))
-            ];
-
-            console.log(`[AI] Sending to ${provider} (${baseUrl}) model=${model}, messages=${finalMessages.length}`);
-
-            const completion = await client.chat.completions.create({
-                messages: finalMessages,
-                model: model as string,
-            });
-
-            const reply = completion.choices?.[0]?.message?.content;
-
-            if (!reply) {
-                return {
-                    success: false,
-                    error: 'AI returned an empty response. Please try again.'
-                };
-            }
-
-            return { success: true, content: reply };
 
         } catch (error: any) {
             console.error(`[AI] ${provider} API Error:`, error);
@@ -240,9 +268,24 @@ ${context}`;
             if (error.status === 401) {
                 errorMsg = `Authentication failed. Please check your ${provider} API key in Settings.`;
             } else if (error.status === 404) {
-                errorMsg = `Model "${model}" not found. Please check the model name in Settings.`;
-            } else if (error.status === 400) {
-                errorMsg = `Bad request to ${provider}: ${error.message}. Check model name and API key.`;
+                errorMsg = `Endpoint or Model not found (404). If using a custom URL, verify it. Model: "${model}". Error details: ${error.message}`;
+
+                if (provider === 'anthropic' && error.message.includes('not_found_error')) {
+                    try {
+                        let anthropicBaseUrl: string | undefined = baseUrl && baseUrl.length > 5 ? baseUrl as string : undefined;
+                        if (anthropicBaseUrl && anthropicBaseUrl.includes('api.anthropic.com')) {
+                            anthropicBaseUrl = undefined;
+                        }
+                        const testClient = new Anthropic({ apiKey: apiKey as string, baseURL: anthropicBaseUrl });
+                        const modelsList = await testClient.models.list();
+                        const available = modelsList.data.map((m: any) => m.id).join('\\n- ');
+                        errorMsg = `Anthropic Error: Model "${model}" was not found (it might be retired, or restricted from your billing tier).\\n\\nHere are the EXACT models your API key has access to:\\n- ${available}\\n\\nPlease update your Model Name in Settings to one of those!`;
+                    } catch (e) {
+                        console.error('Failed to auto-fetch Anthropic models:', e);
+                    }
+                }
+            } else if (error.status === 400 || error.status === 403) {
+                errorMsg = `API Error from ${provider}: ${error.message}. Check that model "${model}" is valid.`;
             } else if (error.code === 'ECONNREFUSED') {
                 errorMsg = `Cannot connect to ${baseUrl}. Please check the Base URL in Settings.`;
             }

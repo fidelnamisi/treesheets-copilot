@@ -10,12 +10,12 @@ interface AiConfigData {
 
 interface ElectronAPI {
     getWorkspaces: () => Promise<import('./shared/types').Workspace[]>;
-    addWorkspace: (data: any) => Promise<import('./shared/types').Workspace>;
-    removeWorkspace: (id: string) => Promise<import('./shared/types').Workspace[]>;
-    selectDirectory: () => Promise<{ path: string; name: string } | null>;
+    createWorkspace: () => Promise<import('./shared/types').Workspace | null>;
+    openWorkspace: () => Promise<import('./shared/types').Workspace | null>;
+    removeWorkspace: (id: string) => Promise<boolean>;
     getLastActiveWorkspace: () => Promise<string | undefined>;
     setLastActiveWorkspace: (id: string) => Promise<void>;
-    scanWorkspaceFiles: (path: string) => Promise<{ name: string; path: string; relativePath: string; lastModified: number; size: number }[]>;
+    scanWorkspaceFiles: (paths: string[]) => Promise<{ name: string; path: string; relativePath: string; lastModified: number; size: number }[]>;
     parseCtsFile: (path: string) => Promise<{ success: boolean; content?: string; error?: string }>;
     startWatching: (path: string) => Promise<void>;
     stopWatching: () => Promise<void>;
@@ -28,10 +28,17 @@ interface ElectronAPI {
     setApiKey: (key: string) => Promise<boolean>;
     getAiConfig: () => Promise<AiConfigData>;
     setAiConfig: (config: AiConfigData) => Promise<boolean>;
+    // Models
+    getModels: () => Promise<import('./shared/types').CustomModel[]>;
+    saveModel: (model: import('./shared/types').CustomModel) => Promise<boolean>;
+    deleteModel: (id: string) => Promise<boolean>;
+    setActiveModel: (id: string) => Promise<boolean>;
+    getActiveModel: () => Promise<import('./shared/types').CustomModel | null>;
     // File Ops
-    importFile: (workspacePath: string) => Promise<boolean>;
+    importFile: () => Promise<string[]>;
     openFileNative: (filePath: string) => Promise<{ success: boolean; error?: string }>;
     exportChat: (data: { title: string; content: string }) => Promise<{ success: boolean; path?: string; error?: string }>;
+    deleteFile: (filePath: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 interface Window {

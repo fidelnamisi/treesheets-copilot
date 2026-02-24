@@ -18,57 +18,45 @@ export const IPC_CHANNELS_FILES = {
 };
 
 export const registerFileHandlers = () => {
-    // Scan workspace directory for .cts files
-    ipcMain.handle(IPC_CHANNELS_FILES.SCAN_WORKSPACE_FILES, async (_, workspacePath: string) => {
+    // Get details for referenced files
+    ipcMain.handle(IPC_CHANNELS_FILES.SCAN_WORKSPACE_FILES, async (_, filePaths: string[]) => {
         try {
-            // Find all .cts files recursively
-            // Using fast-glob which returns forward slashes even on Windows, 
-            // but we might want OS specific for display? Usually forward slash relative paths are fine for keys.
-            const entries = await fg(['**/*.cts'], {
-                cwd: workspacePath,
-                stats: true,
-                absolute: true,
-                ignore: ['**/node_modules/**']
-            });
-
-            const files: WorkspaceFile[] = entries.map((entry: any) => ({
-                name: entry.name,
-                path: entry.path, // Absolute path
-                relativePath: path.relative(workspacePath, entry.path),
-                lastModified: entry.stats?.mtimeMs || 0,
-                size: entry.stats?.size || 0
-            }));
-
-            // Sort by name for now
+            const files: WorkspaceFile[] = [];
+            for (const filePath of filePaths) {
+                try {
+                    const stats = await fs.stat(filePath);
+                    files.push({
+                        name: path.basename(filePath),
+                        path: filePath,
+                        relativePath: path.basename(filePath),
+                        lastModified: stats.mtimeMs,
+                        size: stats.size
+                    });
+                } catch (e) {
+                    // Ignore missing files or log them
+                    console.warn(`File not found: ${filePath}`);
+                }
+            }
+            // Sort by name
             return files.sort((a, b) => a.name.localeCompare(b.name));
         } catch (error) {
-            console.error('Error scanning workspace files:', error);
+            console.error('Error fetching file details:', error);
             return [];
         }
     });
 
-    ipcMain.handle('import-file', async (event, workspacePath: string) => {
+    ipcMain.handle('import-file', async () => {
         const { dialog } = await import('electron');
         const result = await dialog.showOpenDialog({
-            properties: ['openFile'],
+            properties: ['openFile', 'multiSelections'],
             filters: [{ name: 'TreeSheets Files', extensions: ['cts'] }]
         });
 
         if (result.canceled || result.filePaths.length === 0) {
-            return false;
+            return [];
         }
 
-        const sourcePath = result.filePaths[0];
-        const fileName = path.basename(sourcePath);
-        const destPath = path.join(workspacePath, fileName);
-
-        try {
-            await fs.copyFile(sourcePath, destPath);
-            return true;
-        } catch (error) {
-            console.error('Failed to import file:', error);
-            return false;
-        }
+        return result.filePaths;
     });
 
     // Open file in native application
@@ -112,4 +100,5 @@ export const registerFileHandlers = () => {
             return { success: false, error: error.message };
         }
     });
+
 };
